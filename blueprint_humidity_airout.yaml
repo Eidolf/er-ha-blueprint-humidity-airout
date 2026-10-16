@@ -1,0 +1,210 @@
+blueprint:
+  name: "Lüftungsempfehlung (Absolute Luftfeuchtigkeit)"
+  description: >
+    Berechnet die absolute Luftfeuchtigkeit für Innen- und Außenbereich
+    aus Temperatur und relativer Luftfeuchtigkeit und steuert einen Helfer
+    (z. B. input_boolean / Template-Binary-Sensor) oder löst Aktionen aus,
+    wenn Lüften sinnvoll ist (Innenfeuchte > Außenfeuchte + Schwellenwert).
+  domain: automation
+  input:
+    indoor_temp_sensor:
+      name: Raumtemperatur-Sensor
+      description: Sensor für die Temperatur im Raum (°C).
+      selector:
+        entity:
+          filter:
+            - domain: sensor
+              device_class: temperature
+    indoor_humidity_sensor:
+      name: Raumluftfeuchte-Sensor
+      description: Sensor für die relative Luftfeuchtigkeit im Raum (%).
+      selector:
+        entity:
+          filter:
+            - domain: sensor
+              device_class: humidity
+    outdoor_temp_sensor:
+      name: Außentemperatur-Sensor
+      description: Sensor für die Temperatur im Außenbereich (°C).
+      selector:
+        entity:
+          filter:
+            - domain: sensor
+              device_class: temperature
+    outdoor_humidity_sensor:
+      name: Außenluftfeuchte-Sensor
+      description: Sensor für die relative Luftfeuchtigkeit im Außenbereich (%).
+      selector:
+        entity:
+          filter:
+            - domain: sensor
+              device_class: humidity
+    ventilation_target_boolean:
+      name: Lüftungsempfehlung Schalter/Helfer (Optional)
+      description: >
+        Ein input_boolean-Helfer, der auf 'on' gesetzt wird, wenn Lüften empfohlen ist,
+        und auf 'off', wenn nicht. (Optional)
+      default:
+      selector:
+        entity:
+          filter:
+            - domain: input_boolean
+    indoor_abs_humidity_target:
+      name: Zielhelfer absolute Raumfeuchte (Optional)
+      description: Optionaler input_number Helfer zur Speicherung der berechneten absoluten Raumfeuchte in g/m³.
+      default:
+      selector:
+        entity:
+          filter:
+            - domain: input_number
+    outdoor_abs_humidity_target:
+      name: Zielhelfer absolute Außenfeuchte (Optional)
+      description: Optionaler input_number Helfer zur Speicherung der berechneten absoluten Außenfeuchte in g/m³.
+      default:
+      selector:
+        entity:
+          filter:
+            - domain: input_number
+    min_abs_humidity_difference:
+      name: Mindestdifferenz absolute Luftfeuchtigkeit (g/m³)
+      description: >
+        Schwellenwert: Lüften wird erst empfohlen, wenn die Raumfeuchte um diesen Wert
+        höher ist als die Außenfeuchte (Hysterese/Effektivität). Standard: 0.5 g/m³.
+      default: 0.5
+      selector:
+        number:
+          min: 0.0
+          max: 5.0
+          step: 0.1
+          unit_of_measurement: "g/m³"
+          mode: slider
+    min_indoor_temp:
+      name: Minimale Raumtemperatur (°C)
+      description: Lüften nicht empfehlen, wenn die Raumtemperatur darunter liegt (Auskschutz).
+      default: 16.0
+      selector:
+        number:
+          min: 10.0
+          max: 25.0
+          step: 0.5
+          unit_of_measurement: "°C"
+          mode: slider
+    actions_ventilation_recommended:
+      name: Aktionen bei Lüftungsempfehlung (True)
+      description: Optionale Aktionen (z. B. Benachrichtigung senden, Licht schalten), wenn Lüften empfohlen wird.
+      default: []
+      selector:
+        action: {}
+    actions_ventilation_not_recommended:
+      name: Aktionen wenn kein Lüften empfohlen (False)
+      description: Optionale Aktionen, wenn Lüften beendet / nicht mehr empfohlen wird.
+      default: []
+      selector:
+        action: {}
+
+mode: restart
+max_exceeded: silent
+
+trigger:
+  - platform: state
+    entity_id:
+      - !input indoor_temp_sensor
+      - !input indoor_humidity_sensor
+      - !input outdoor_temp_sensor
+      - !input outdoor_humidity_sensor
+
+variables:
+  indoor_temp_entity: !input indoor_temp_sensor
+  indoor_hum_entity: !input indoor_humidity_sensor
+  outdoor_temp_entity: !input outdoor_temp_sensor
+  outdoor_hum_entity: !input outdoor_humidity_sensor
+  vent_boolean: !input ventilation_target_boolean
+  in_abs_target: !input indoor_abs_humidity_target
+  out_abs_target: !input outdoor_abs_humidity_target
+  min_diff: !input min_abs_humidity_difference
+  min_room_temp: !input min_indoor_temp
+
+  # Sensor values
+  ti: "{{ states(indoor_temp_entity) | float(none) }}"
+  hi: "{{ states(indoor_hum_entity) | float(none) }}"
+  to: "{{ states(outdoor_temp_entity) | float(none) }}"
+  ho: "{{ states(outdoor_hum_entity) | float(none) }}"
+
+  valid_input: "{{ ti is not none and hi is not none and to is not none and ho is not none }}"
+
+  # Absolute humidity calculation in g/m³ using Arden Buck equation approximation:
+  # absolute_humidity = (6.112 * e^((17.67 * T)/(T + 243.5)) * rh * 2.1674) / (273.15 + T)
+  abs_humidity_indoor: >-
+    {% if valid_input %}
+      {% set t = ti %}
+      {% set rh = hi %}
+      {% set sat_vp = 6.112 * (e ** ((17.67 * t) / (t + 243.5))) %}
+      {{ ((sat_vp * (rh / 100.0) * 216.7) / (273.15 + t)) | round(2) }}
+    {% else %}
+      none
+    {% endif %}
+
+  abs_humidity_outdoor: >-
+    {% if valid_input %}
+      {% set t = to %}
+      {% set rh = ho %}
+      {% set sat_vp = 6.112 * (e ** ((17.67 * t) / (t + 243.5))) %}
+      {{ ((sat_vp * (rh / 100.0) * 216.7) / (273.15 + t)) | round(2) }}
+    {% else %}
+      none
+    {% endif %}
+
+  should_ventilate: >-
+    {% if valid_input and abs_humidity_indoor is not none and abs_humidity_outdoor is not none %}
+      {{ (abs_humidity_indoor - abs_humidity_outdoor) >= (min_diff | float(0.5)) and ti >= (min_room_temp | float(16.0)) }}
+    {% else %}
+      false
+    {% endif %}
+
+condition:
+  - condition: template
+    value_template: "{{ valid_input }}"
+
+action:
+  # Update optional indoor absolute humidity helper
+  - if:
+      - condition: template
+        value_template: "{{ in_abs_target is not none and in_abs_target != '' }}"
+    then:
+      - service: input_number.set_value
+        target:
+          entity_id: !input indoor_abs_humidity_target
+        data:
+          value: "{{ abs_humidity_indoor }}"
+
+  # Update optional outdoor absolute humidity helper
+  - if:
+      - condition: template
+        value_template: "{{ out_abs_target is not none and out_abs_target != '' }}"
+    then:
+      - service: input_number.set_value
+        target:
+          entity_id: !input outdoor_abs_humidity_target
+        data:
+          value: "{{ abs_humidity_outdoor }}"
+
+  # Update optional ventilation recommended boolean helper
+  - if:
+      - condition: template
+        value_template: "{{ vent_boolean is not none and vent_boolean != '' }}"
+    then:
+      - service: >-
+          {{ 'input_boolean.turn_on' if should_ventilate else 'input_boolean.turn_off' }}
+        target:
+          entity_id: !input ventilation_target_boolean
+
+  # Execute custom actions
+  - if:
+      - condition: template
+        value_template: "{{ should_ventilate }}"
+    then:
+      - choose: []
+        default: !input actions_ventilation_recommended
+    else:
+      - choose: []
+        default: !input actions_ventilation_not_recommended
